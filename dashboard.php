@@ -3,266 +3,87 @@ session_start();
 require_once 'db.php';
 require_once 'nepali_date.php';
 
-if (!isset($_SESSION['user_id'])) {
-    header("Location: login.php");
-    exit();
-}
+if (!isset($_SESSION['user_id'])) { header("Location: login.php"); exit(); }
 
-$user_id      = $_SESSION['user_id'];
-$userName     = $_SESSION['name'] ?? 'User';
+$user_id = (int)$_SESSION['user_id'];
+$userName = $_SESSION['name'] ?? 'User';
 $profilePhoto = $_SESSION['profile_photo'] ?? 'default.png';
-$joinedBs     = $_SESSION['joined_date_bs'] ?? '2083-04-16';
-
+$joinedBs = $_SESSION['joined_date_bs'] ?? '';
 $today_ad = date('Y-m-d');
 $today_bs = NepaliDateConverter::convertAdToBs($today_ad);
+$monthStart = date('Y-m-01');
 
-// 1. Fetch Summary Totals per Category for Logged-in User
-$summaryQuery = "SELECT 
-    SUM(CASE WHEN transaction_type = 'starting_balance' THEN amount ELSE 0 END) AS total_starting_balance,
-    SUM(CASE WHEN transaction_type = 'income' THEN amount ELSE 0 END) AS total_income,
-    SUM(CASE WHEN transaction_type = 'expense' THEN amount ELSE 0 END) AS total_expense,
-    SUM(CASE WHEN transaction_type = 'lend' THEN amount ELSE 0 END) AS total_lend,
-    SUM(CASE WHEN transaction_type = 'borrow' THEN amount ELSE 0 END) AS total_borrow,
-    SUM(CASE WHEN transaction_type = 'investment' THEN amount ELSE 0 END) AS total_investment,
-    SUM(CASE WHEN transaction_type = 'loss' THEN amount ELSE 0 END) AS total_loss
-    FROM transactions WHERE user_id = ?";
+$summaryQuery = "SELECT
+ SUM(CASE WHEN transaction_type='starting_balance' THEN amount ELSE 0 END) starting_balance,
+ SUM(CASE WHEN transaction_type='income' THEN amount ELSE 0 END) income,
+ SUM(CASE WHEN transaction_type='expense' THEN amount ELSE 0 END) expense,
+ SUM(CASE WHEN transaction_type='lend' THEN amount ELSE 0 END) lend,
+ SUM(CASE WHEN transaction_type='borrow' THEN amount ELSE 0 END) borrow,
+ SUM(CASE WHEN transaction_type='investment' THEN amount ELSE 0 END) investment,
+ SUM(CASE WHEN transaction_type='loss' THEN amount ELSE 0 END) loss
+ FROM transactions WHERE user_id=?";
+$stmt=$conn->prepare($summaryQuery); $stmt->bind_param('i',$user_id); $stmt->execute();
+$totals=$stmt->get_result()->fetch_assoc() ?: [];
+$starting=(float)($totals['starting_balance']??0); $income=(float)($totals['income']??0); $expense=(float)($totals['expense']??0);
+$lend=(float)($totals['lend']??0); $borrow=(float)($totals['borrow']??0); $investment=(float)($totals['investment']??0); $loss=(float)($totals['loss']??0);
+$balance=($starting+$income+$borrow)-($expense+$lend+$investment+$loss);
 
-$sumStmt = $conn->prepare($summaryQuery);
-$sumStmt->bind_param("i", $user_id);
-$sumStmt->execute();
-$totals = $sumStmt->get_result()->fetch_assoc();
+$monthQuery="SELECT
+ SUM(CASE WHEN transaction_type='income' THEN amount ELSE 0 END) income,
+ SUM(CASE WHEN transaction_type='expense' THEN amount ELSE 0 END) expense,
+ COUNT(*) entries FROM transactions WHERE user_id=? AND date_ad>=?";
+$stmt=$conn->prepare($monthQuery); $stmt->bind_param('is',$user_id,$monthStart); $stmt->execute(); $month=$stmt->get_result()->fetch_assoc() ?: [];
+$monthIncome=(float)($month['income']??0); $monthExpense=(float)($month['expense']??0); $monthEntries=(int)($month['entries']??0);
+$savingsRate=$monthIncome>0 ? max(0,min(100,(($monthIncome-$monthExpense)/$monthIncome)*100)) : 0;
+$health=(int)max(0,min(100,50+($savingsRate*0.4)+($balance>0?15:0)-($borrow>0?5:0)));
 
-// Calculate Net Available Balance:
-$startingCapital = $totals['total_starting_balance'] ?? 0;
-$totalIncome     = $totals['total_income'] ?? 0;
-$totalExpense    = $totals['total_expense'] ?? 0;
-$totalLend       = $totals['total_lend'] ?? 0;
-$totalBorrow     = $totals['total_borrow'] ?? 0;
-$totalInvestment = $totals['total_investment'] ?? 0;
-$totalLoss       = $totals['total_loss'] ?? 0;
+$recent=$conn->prepare("SELECT id,transaction_type,subject,amount,date_bs,remarks FROM transactions WHERE user_id=? ORDER BY id DESC LIMIT 6");
+$recent->bind_param('i',$user_id); $recent->execute(); $recentRows=$recent->get_result();
 
-$netBalance = ($startingCapital + $totalIncome + $totalBorrow) - ($totalExpense + $totalLend + $totalInvestment + $totalLoss);
+$top=$conn->prepare("SELECT subject,SUM(amount) total FROM transactions WHERE user_id=? AND transaction_type='expense' GROUP BY subject ORDER BY total DESC LIMIT 1");
+$top->bind_param('i',$user_id); $top->execute(); $topExpense=$top->get_result()->fetch_assoc();
 
-// 2. Fetch Grouped Totals Topic-by-Topic for the Dashboard Table
-$topicQuery = "SELECT 
-    transaction_type, 
-    COUNT(*) AS total_entries, 
-    SUM(amount) AS total_amount 
-    FROM transactions 
-    WHERE user_id = ? 
-    GROUP BY transaction_type 
-    ORDER BY total_amount DESC";
-
-$topicStmt = $conn->prepare($topicQuery);
-$topicStmt->bind_param("i", $user_id);
-$topicStmt->execute();
-$topicResults = $topicStmt->get_result();
-
-// Topic Mapping Labels & Styles
-$topicLabels = [
-    'starting_balance' => ['label' => 'Starting Balance / Wallets', 'badge' => 'badge-starting_balance'],
-    'income'           => ['label' => 'Income / Profit / Bonus',    'badge' => 'badge-income'],
-    'expense'          => ['label' => 'Expenses (Food, Petrol)',    'badge' => 'badge-expense'],
-    'lend'             => ['label' => 'Lend (Money Given)',         'badge' => 'badge-lend'],
-    'borrow'           => ['label' => 'Borrow (Debts / Ward)',       'badge' => 'badge-borrow'],
-    'investment'       => ['label' => 'Investments (NEPSE / SIP)',  'badge' => 'badge-investment'],
-    'loss'             => ['label' => 'Trading / Share Loss',       'badge' => 'badge-loss']
+$labels=[
+ 'starting_balance'=>['Opening','start','＋'],'income'=>['Income','income','＋'],'expense'=>['Expense','expense','−'],
+ 'lend'=>['Lent','lend','−'],'borrow'=>['Borrowed','borrow','＋'],'investment'=>['Invested','investment','−'],'loss'=>['Loss','loss','−']
 ];
+function money($n){ return 'Rs. '.number_format((float)$n,2); }
+function e($s){ return htmlspecialchars((string)$s,ENT_QUOTES,'UTF-8'); }
 ?>
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>AI Accountant - Executive Summary</title>
-    <style>
-        * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; -webkit-tap-highlight-color: transparent; }
-        body { background-color: #f8fafc; color: #0f172a; padding-bottom: 85px; }
-        
-        /* App Header */
-        .app-header { background: #ffffff; padding: 14px 16px; position: sticky; top: 0; z-index: 90; box-shadow: 0 1px 3px rgba(0,0,0,0.05); display: flex; align-items: center; justify-content: space-between; }
-        .user-profile { display: flex; align-items: center; gap: 12px; }
-        .avatar { width: 44px; height: 44px; border-radius: 50%; object-fit: cover; border: 2px solid #2563eb; }
-        .user-info h2 { font-size: 15px; font-weight: 700; }
-        .user-info p { font-size: 11px; color: #64748b; }
-        
-        .container { padding: 16px; max-width: 500px; margin: 0 auto; }
-        
-        /* Net Liquidity Banner */
-        .net-worth-card { background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%); color: #ffffff; padding: 20px; border-radius: 18px; box-shadow: 0 8px 20px rgba(15, 23, 42, 0.15); margin-bottom: 16px; }
-        .net-worth-card span { font-size: 11px; color: #94a3b8; text-transform: uppercase; font-weight: 600; letter-spacing: 0.5px; }
-        .net-worth-card h1 { font-size: 28px; margin: 6px 0 14px 0; font-weight: 800; }
-        .card-row { display: flex; justify-content: space-between; border-top: 1px solid rgba(255, 255, 255, 0.1); padding-top: 12px; }
-        
-        /* 2x3 Category Summary Grid */
-        .summary-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 16px; }
-        .grid-box { background: #ffffff; padding: 14px; border-radius: 14px; box-shadow: 0 2px 6px rgba(0,0,0,0.02); border: 1px solid #f1f5f9; }
-        .grid-box span { font-size: 11px; color: #64748b; font-weight: 600; display: block; margin-bottom: 4px; }
-        .grid-box h3 { font-size: 16px; font-weight: 700; }
-        
-        .box-start h3 { color: #0284c7; }
-        .box-income h3 { color: #16a34a; }
-        .box-expense h3 { color: #dc2626; }
-        .box-lend h3 { color: #2563eb; }
-        .box-borrow h3 { color: #d97706; }
-        .box-invest h3 { color: #7c3aed; }
-        
-        /* Topic Breakdown Table Styling */
-        .table-card { background: #ffffff; border-radius: 16px; padding: 16px; box-shadow: 0 2px 6px rgba(0,0,0,0.02); border: 1px solid #f1f5f9; margin-bottom: 16px; overflow-x: auto; }
-        .table-card h4 { font-size: 13px; margin-bottom: 12px; color: #334155; display: flex; justify-content: space-between; align-items: center; }
-        
-        .topic-table { width: 100%; border-collapse: collapse; text-align: left; }
-        .topic-table th { font-size: 11px; font-weight: 600; color: #64748b; text-transform: uppercase; padding: 8px 6px; border-bottom: 2px solid #f1f5f9; }
-        .topic-table td { padding: 10px 6px; font-size: 12px; border-bottom: 1px solid #f8fafc; vertical-align: middle; }
-        .topic-table tr:last-child td { border-bottom: none; }
-
-        /* Dynamic Badges for Category Topics */
-        .badge { font-size: 10px; font-weight: 700; padding: 3px 8px; border-radius: 6px; display: inline-block; }
-        .badge-starting_balance { background: #e0f2fe; color: #0369a1; }
-        .badge-income { background: #dcfce7; color: #15803d; }
-        .badge-expense { background: #fee2e2; color: #b91c1c; }
-        .badge-lend { background: #eff6ff; color: #1d4ed8; }
-        .badge-borrow { background: #fef3c7; color: #b45309; }
-        .badge-investment { background: #f3e8ff; color: #6b21a8; }
-        .badge-loss { background: #ffe4e6; color: #9f1239; }
-
-        /* Bottom Fixed Navigation Bar */
-        .bottom-nav { position: fixed; bottom: 0; left: 0; right: 0; height: 65px; background: #ffffff; border-top: 1px solid #e2e8f0; display: flex; justify-content: space-around; align-items: center; z-index: 1000; }
-        .nav-item { display: flex; flex-direction: column; align-items: center; text-decoration: none; color: #64748b; font-size: 10px; font-weight: 600; gap: 3px; }
-        .nav-item.active { color: #2563eb; }
-        .nav-item svg { width: 22px; height: 22px; fill: currentColor; }
-        .nav-add-btn { background: #2563eb; color: #ffffff; width: 48px; height: 48px; border-radius: 50%; display: flex; align-items: center; justify-content: center; margin-top: -24px; box-shadow: 0 4px 12px rgba(37, 99, 235, 0.4); text-decoration: none; }
-        .nav-add-btn svg { width: 26px; height: 26px; fill: #ffffff; }
-    </style>
-</head>
-<body>
-
-    <!-- Header Section -->
-    <header class="app-header">
-        <div class="user-profile">
-            <img src="uploads/<?= htmlspecialchars($profilePhoto); ?>" alt="Profile" class="avatar" onerror="this.src='https://via.placeholder.com/44'">
-            <div class="user-info">
-                <h2><?= htmlspecialchars($userName); ?></h2>
-                <p>Joined ID: <strong style="color: #2563eb;"><?= htmlspecialchars($joinedBs); ?> BS</strong></p>
-            </div>
-        </div>
-        <div style="font-size: 11px; color: #64748b; text-align: right;">
-            <strong><?= $today_bs ?> BS</strong><br>
-            <a href="logout.php" style="color: #dc2626; text-decoration: none; font-weight: 600;">Logout</a>
-        </div>
-    </header>
-
-    <div class="container">
-
-        <!-- Central Net Balance Card -->
-        <div class="net-worth-card">
-            <span>Net Available Cash & Wallet Balance</span>
-            <h1>Rs. <?= number_format($netBalance, 2); ?></h1>
-            <div class="card-row">
-                <div>
-                    <p style="font-size:11px; color:#94a3b8;">Starting Bank/Wallet</p>
-                    <strong style="color: #38bdf8;">Rs. <?= number_format($startingCapital, 2); ?></strong>
-                </div>
-                <div style="text-align: right;">
-                    <p style="font-size:11px; color:#94a3b8;">Earned Income</p>
-                    <strong style="color: #4ade80;">+ Rs. <?= number_format($totalIncome, 2); ?></strong>
-                </div>
-            </div>
-        </div>
-
-        <!-- 2x3 Category Summary Grid -->
-        <div class="summary-grid">
-            <div class="grid-box box-start">
-                <span>Opening Capital</span>
-                <h3>Rs. <?= number_format($startingCapital, 2); ?></h3>
-            </div>
-            <div class="grid-box box-income">
-                <span>Income / Profit / Bonus</span>
-                <h3>Rs. <?= number_format($totalIncome, 2); ?></h3>
-            </div>
-            <div class="grid-box box-expense">
-                <span>Expenses (Food, Petrol)</span>
-                <h3>Rs. <?= number_format($totalExpense, 2); ?></h3>
-            </div>
-            <div class="grid-box box-lend">
-                <span>Lend (Given Out)</span>
-                <h3>Rs. <?= number_format($totalLend, 2); ?></h3>
-            </div>
-            <div class="grid-box box-borrow">
-                <span>Borrow (Owed / Debt)</span>
-                <h3>Rs. <?= number_format($totalBorrow, 2); ?></h3>
-            </div>
-            <div class="grid-box box-invest">
-                <span>Investment (NEPSE/SIP)</span>
-                <h3>Rs. <?= number_format($totalInvestment, 2); ?></h3>
-            </div>
-        </div>
-
-        <!-- Topic Breakdown Table Block -->
-        <div class="table-card">
-            <h4>
-                <span>📊 Category & Topic Summary Table</span>
-                <a href="ledger.php" style="color: #2563eb; text-decoration: none; font-size: 11px;">Detailed Ledger &rarr;</a>
-            </h4>
-            
-            <table class="topic-table">
-                <thead>
-                    <tr>
-                        <th>Topic / Category</th>
-                        <th style="text-align: center;">Entries</th>
-                        <th style="text-align: right;">Total Amount</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    <?php if ($topicResults->num_rows > 0): ?>
-                        <?php while ($row = $topicResults->fetch_assoc()): ?>
-                            <?php 
-                                $typeKey  = $row['transaction_type'];
-                                $badgeCls = $topicLabels[$typeKey]['badge'] ?? 'badge-income';
-                                $labelName= $topicLabels[$typeKey]['label'] ?? ucfirst($typeKey);
-                            ?>
-                            <tr>
-                                <td>
-                                    <span class="badge <?= $badgeCls; ?>"><?= htmlspecialchars($labelName); ?></span>
-                                </td>
-                                <td style="text-align: center; color: #64748b; font-weight: 600;">
-                                    <?= $row['total_entries']; ?>
-                                </td>
-                                <td style="text-align: right; font-weight: 700; color: #0f172a;">
-                                    Rs. <?= number_format($row['total_amount'], 2); ?>
-                                </td>
-                            </tr>
-                        <?php endwhile; ?>
-                    <?php else: ?>
-                        <tr>
-                            <td colspan="3" style="text-align: center; color: #94a3b8; font-size: 12px; padding: 16px 0;">
-                                No transactions logged yet. Tap <strong>+</strong> to start recording!
-                            </td>
-                        </tr>
-                    <?php endif; ?>
-                </tbody>
-            </table>
-        </div>
-
-    </div>
-
-    <!-- Fixed Bottom Navigation Bar -->
-    <nav class="bottom-nav">
-        <a href="dashboard.php" class="nav-item active">
-            <svg viewBox="0 0 24 24"><path d="M10 20v-6h4v6h5v-8h3L12 3 2 12h3v8z"/></svg>
-            <span>Summary</span>
-        </a>
-        <a href="ledger.php" class="nav-item">
-            <svg viewBox="0 0 24 24"><path d="M19 3H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm-2 10h-4v4h-2v-4H7v-2h4V7h2v4h4v2z"/></svg>
-            <span>Ledger</span>
-        </a>
-        <a href="add_entry.php" class="nav-add-btn">
-            <svg viewBox="0 0 24 24"><path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z"/></svg>
-        </a>
-        <a href="reports.php" class="nav-item">
-            <svg viewBox="0 0 24 24"><path d="M19 3H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zM9 17H7v-7h2v7zm4 0h-2v-10h2v10zm4 0h-2v-4h2v4z"/></svg>
-            <span>Reports</span>
-        </a>
-    </nav>
-</body>
-</html>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#0f172a"><title>My Money — Dashboard</title>
+<style>
+:root{--bg:#f5f7fb;--card:#fff;--text:#0f172a;--muted:#64748b;--line:#e8edf3;--primary:#2563eb;--dark:#0f172a;--green:#16a34a;--red:#dc2626;--amber:#d97706;--purple:#7c3aed;--blue:#0284c7}
+*{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;background:var(--bg);color:var(--text);font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;padding-bottom:92px;-webkit-font-smoothing:antialiased}.app{width:100%;max-width:520px;margin:auto}.top{position:sticky;top:0;z-index:20;background:rgba(245,247,251,.94);backdrop-filter:blur(16px);padding:12px 16px 10px;display:flex;align-items:center;justify-content:space-between}.profile{display:flex;align-items:center;gap:11px}.avatar{width:42px;height:42px;border-radius:14px;object-fit:cover;border:1px solid #dbe4f0;background:#e2e8f0}.hello{font-size:11px;color:var(--muted);margin:0 0 2px}.name{font-size:16px;font-weight:800;margin:0}.today{text-align:right;font-size:10px;color:var(--muted);line-height:1.5}.today strong{color:var(--text);font-size:11px}.wrap{padding:8px 16px 0}.hero{position:relative;overflow:hidden;background:linear-gradient(145deg,#172033,#0b1220);border-radius:24px;padding:22px;color:#fff;box-shadow:0 14px 30px rgba(15,23,42,.18)}.hero:after{content:"";position:absolute;width:150px;height:150px;border:1px solid rgba(255,255,255,.08);border-radius:50%;right:-50px;top:-50px}.eyebrow{font-size:11px;color:#aab5c7;font-weight:700;text-transform:uppercase;letter-spacing:.6px}.balance{font-size:30px;font-weight:850;letter-spacing:-1px;margin:5px 0 18px}.hero-row{display:grid;grid-template-columns:1fr 1fr;gap:10px}.hero-stat{border-top:1px solid rgba(255,255,255,.1);padding-top:10px}.hero-stat small{display:block;color:#9ba8bb;font-size:10px}.hero-stat b{display:block;margin-top:3px;font-size:13px}.positive{color:#4ade80}.negative{color:#fb7185}.section-head{display:flex;align-items:center;justify-content:space-between;margin:20px 1px 10px}.section-head h2{font-size:15px;margin:0;font-weight:800}.section-head a{font-size:11px;color:var(--primary);font-weight:700;text-decoration:none}.quick{display:grid;grid-template-columns:repeat(4,1fr);gap:9px}.quick a{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:12px 6px;text-align:center;text-decoration:none;color:var(--text);box-shadow:0 3px 10px rgba(15,23,42,.03);transition:.15s}.quick a:active{transform:scale(.96)}.quick .ico{width:34px;height:34px;margin:0 auto 6px;border-radius:11px;display:grid;place-items:center;font-size:18px;background:#eff6ff}.quick span{font-size:10px;font-weight:750}.grid{display:grid;grid-template-columns:1fr 1fr;gap:9px}.stat{background:var(--card);border:1px solid var(--line);border-radius:17px;padding:14px;min-height:88px;box-shadow:0 3px 10px rgba(15,23,42,.025)}.stat .label{font-size:10px;color:var(--muted);font-weight:700}.stat .value{font-size:15px;font-weight:850;margin-top:5px}.income{color:var(--green)}.expense{color:var(--red)}.lend{color:var(--blue)}.borrow{color:var(--amber)}.investment{color:var(--purple)}.loss{color:#be123c}.progress-card,.recent,.insight{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:15px;box-shadow:0 3px 10px rgba(15,23,42,.025)}.month-row{display:flex;justify-content:space-between;align-items:flex-end}.month-row small{font-size:10px;color:var(--muted)}.month-row strong{font-size:18px}.bar{height:9px;background:#eef2f7;border-radius:20px;overflow:hidden;margin:12px 0 8px}.bar i{display:block;height:100%;width:<?= (int)$savingsRate ?>%;background:linear-gradient(90deg,#2563eb,#16a34a);border-radius:inherit}.subrow{display:flex;justify-content:space-between;font-size:10px;color:var(--muted)}.health{display:flex;align-items:center;gap:12px;margin-top:13px;padding-top:12px;border-top:1px solid var(--line)}.ring{width:48px;height:48px;border-radius:50%;display:grid;place-items:center;background:conic-gradient(var(--primary) <?= $health ?>%,#e9eef5 0)}.ring:after{content:"";width:38px;height:38px;border-radius:50%;background:#fff}.ring b{position:absolute;font-size:11px}.health strong{font-size:12px}.health p{font-size:10px;color:var(--muted);margin:3px 0 0}.recent-item{display:flex;align-items:center;gap:10px;padding:12px 0;border-bottom:1px solid #f0f3f7}.recent-item:last-child{border-bottom:0;padding-bottom:2px}.tx-icon{width:36px;height:36px;border-radius:12px;display:grid;place-items:center;font-size:14px;background:#f1f5f9}.tx-main{min-width:0;flex:1}.tx-main strong{display:block;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.tx-main small{display:block;color:#94a3b8;font-size:9px;margin-top:3px}.tx-amount{text-align:right;font-size:12px;font-weight:800}.tx-amount small{display:block;font-size:9px;color:#94a3b8;font-weight:500;margin-top:2px}.insight{display:flex;gap:12px;align-items:center}.insight-icon{width:42px;height:42px;border-radius:14px;background:#fff7ed;display:grid;place-items:center;font-size:19px}.insight h3{font-size:12px;margin:0}.insight p{font-size:10px;color:var(--muted);margin:4px 0 0;line-height:1.45}.bottom{position:fixed;left:0;right:0;bottom:0;height:72px;padding:8px max(12px,env(safe-area-inset-left)) calc(8px + env(safe-area-inset-bottom));background:rgba(255,255,255,.96);backdrop-filter:blur(18px);border-top:1px solid var(--line);display:flex;justify-content:space-around;align-items:center;z-index:50}.nav{width:25%;display:flex;flex-direction:column;align-items:center;gap:3px;color:#64748b;text-decoration:none;font-size:9px;font-weight:750}.nav svg{width:21px;height:21px;fill:currentColor}.nav.active{color:var(--primary)}.add{width:52px;height:52px;margin-top:-25px;border-radius:18px;background:var(--primary);color:#fff;display:grid;place-items:center;box-shadow:0 9px 20px rgba(37,99,235,.32);border:4px solid #f5f7fb}.add svg{width:25px;height:25px;fill:#fff}@media(min-width:700px){body{padding-bottom:30px}.app{max-width:900px}.wrap{display:grid;grid-template-columns:1.25fr .75fr;gap:14px}.hero,.quick,.section-head:first-child{grid-column:1/-1}.quick{grid-template-columns:repeat(4,1fr)}.bottom{max-width:520px;left:50%;right:auto;transform:translateX(-50%);border:1px solid var(--line);border-radius:22px 22px 0 0}}
+</style>
+</head><body>
+<div class="app">
+<header class="top"><div class="profile"><img class="avatar" src="uploads/<?=e($profilePhoto)?>" onerror="this.src='https://via.placeholder.com/42'" alt="Profile"><div><p class="hello">Good to see you 👋</p><h1 class="name"><?=e($userName)?></h1></div></div><div class="today"><strong><?=e($today_bs)?> BS</strong><br><?=e(date('d M Y'))?></div></header>
+<main class="wrap">
+<section class="hero"><div class="eyebrow">Available balance</div><div class="balance"><?=money($balance)?></div><div class="hero-row"><div class="hero-stat"><small>Income</small><b class="positive">+ <?=money($income)?></b></div><div class="hero-stat"><small>Outflow</small><b class="negative">− <?=money($expense+$lend+$investment+$loss)?></b></div></div></section>
+<div class="section-head"><h2>Quick actions</h2><a href="ledger.php">View ledger →</a></div>
+<div class="quick"><a href="add_entry.php"><div class="ico">＋</div><span>Add entry</span></a><a href="add_entry.php?type=income"><div class="ico">↗</div><span>Income</span></a><a href="add_entry.php?type=expense"><div class="ico">↘</div><span>Expense</span></a><a href="reports.php"><div class="ico">▥</div><span>Reports</span></a></div>
+<div class="section-head"><h2>Money overview</h2><a href="reports.php">Insights →</a></div>
+<div class="grid">
+<div class="stat"><div class="label">Opening capital</div><div class="value"><?=money($starting)?></div></div>
+<div class="stat"><div class="label">Income / profit</div><div class="value income"><?=money($income)?></div></div>
+<div class="stat"><div class="label">Expenses</div><div class="value expense"><?=money($expense)?></div></div>
+<div class="stat"><div class="label">Money lent</div><div class="value lend"><?=money($lend)?></div></div>
+<div class="stat"><div class="label">Money borrowed</div><div class="value borrow"><?=money($borrow)?></div></div>
+<div class="stat"><div class="label">Investments</div><div class="value investment"><?=money($investment)?></div></div>
+</div>
+<div class="section-head"><h2>This month</h2><span style="font-size:10px;color:#94a3b8"><?=e(date('F Y'))?></span></div>
+<section class="progress-card"><div class="month-row"><div><small>Income</small><br><strong class="income">+<?=money($monthIncome)?></strong></div><div style="text-align:right"><small>Spent</small><br><strong class="expense">−<?=money($monthExpense)?></strong></div></div><div class="bar"><i></i></div><div class="subrow"><span><?=number_format($savingsRate,0)?>% income retained</span><span><?=$monthEntries?> entries</span></div><div class="health"><div class="ring"><b><?=$health?></b></div><div><strong>Financial health</strong><p><?= $health>=75?'Great control — keep it consistent.':($health>=50?'Healthy start — watch your spending.':'Needs attention — review your outflows.') ?></p></div></div></section>
+<div class="section-head"><h2>Recent activity</h2><a href="ledger.php">See all →</a></div>
+<section class="recent">
+<?php if($recentRows->num_rows): while($r=$recentRows->fetch_assoc()): $meta=$labels[$r['transaction_type']]??['Transaction','income','•']; $isOut=in_array($r['transaction_type'],['expense','lend','investment','loss']); ?>
+<div class="recent-item"><div class="tx-icon <?=e($meta[1])?>"><?=e($meta[2])?></div><div class="tx-main"><strong><?=e($r['subject'])?></strong><small><?=e($meta[0])?> • <?=e($r['date_bs'])?> BS</small></div><div class="tx-amount <?= $isOut?'expense':'income' ?>"><?= $isOut?'−':'+' ?><?=money($r['amount']) ?><small><?=e($r['remarks']?:'No note')?></small></div></div>
+<?php endwhile; else: ?><div style="text-align:center;padding:18px;color:#94a3b8;font-size:11px">No transactions yet. Tap + to record your first one.</div><?php endif; ?></section>
+<div class="section-head"><h2>Smart insight</h2></div>
+<section class="insight"><div class="insight-icon">💡</div><div><h3><?= $topExpense ? 'Highest expense: '.e($topExpense['subject']) : 'Start building your money history' ?></h3><p><?= $topExpense ? money($topExpense['total']).' is your largest expense category. Review it in Reports to understand the trend.' : 'Add a few income and expense entries and the dashboard will calculate your monthly savings and financial health.' ?></p></div></section>
+</main>
+<nav class="bottom"><a class="nav active" href="dashboard.php"><svg viewBox="0 0 24 24"><path d="M3 11.5 12 4l9 7.5V20a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1z"/></svg>Home</a><a class="nav" href="ledger.php"><svg viewBox="0 0 24 24"><path d="M5 3h14a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2zm2 4v2h10V7zm0 4v2h7v-2zm0 4v2h10v-2z"/></svg>Ledger</a><a class="add" href="add_entry.php" aria-label="Add transaction"><svg viewBox="0 0 24 24"><path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6z"/></svg></a><a class="nav" href="reports.php"><svg viewBox="0 0 24 24"><path d="M4 19h16v2H2V3h2zm2-2V9h3v8zm5 0V5h3v12zm5 0v-5h3v5z"/></svg>Reports</a><a class="nav" href="logout.php"><svg viewBox="0 0 24 24"><path d="M10 17v2H5V5h5v2H7v10zm6-4h-5v-2h5l-2-2 1.4-1.4L20.8 12l-5.4 5.4L14 16z"/></svg>Logout</a></nav>
+</div></body></html>
