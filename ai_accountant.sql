@@ -77,7 +77,7 @@ CREATE TABLE `users` (
 --
 
 INSERT INTO `users` (`id`, `name`, `email`, `phone`, `username`, `password`, `profile_photo`, `joined_date_bs`, `created_at`) VALUES
-(3, 'Anup Dahal', 'dahal6270@gmail.com', '9804902634', 'Anup', '$2y$10$PVyGHAaevFRnyBtf0Mkzuekx2p/Ot98.bY4yQrY4/2obHvsg5W1ES', '1785559193_6a6d789954e73.jpeg', '2083-04-16', '2026-08-01 04:39:53');
+(3, 'Anup Dahal', 'dahal@gmail.com', '9804634', 'Anup', '$2y$1vFRYW1ES', '74e73.jpeg', '208-16', '20201 0453');
 
 --
 -- Indexes for dumped tables
