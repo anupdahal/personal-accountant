@@ -15,12 +15,9 @@ class NepaliDateConverter {
     public static function convertAdToBs($ad_date_str) {
         $ad_date = new DateTime($ad_date_str);
         $ref_date = new DateTime(self::$ad_ref_date);
-        
         $diff_days = $ref_date->diff($ad_date)->days;
 
-        if ($ad_date < $ref_date) {
-            return "2080-12-30";
-        }
+        if ($ad_date < $ref_date) return "2080-12-30";
 
         $bs_year = self::$bs_ref_year;
         $bs_month = 1;
@@ -31,17 +28,22 @@ class NepaliDateConverter {
             if ($diff_days >= $days_in_current_month) {
                 $diff_days -= $days_in_current_month;
                 $bs_month++;
-                if ($bs_month > 12) {
-                    $bs_month = 1;
-                    $bs_year++;
-                }
+                if ($bs_month > 12) { $bs_month = 1; $bs_year++; }
             } else {
                 $bs_day += $diff_days;
                 $diff_days = 0;
             }
         }
-
         return sprintf("%04d-%02d-%02d", $bs_year, $bs_month, $bs_day);
+    }
+
+    public static function todayBs() {
+        return self::convertAdToBs(date('Y-m-d'));
+    }
+
+    public static function currentYearMonthBs() {
+        $today = self::todayBs();
+        return substr($today, 0, 7);
     }
 }
 ?>
