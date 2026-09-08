@@ -2,112 +2,504 @@
 session_start();
 require_once 'db.php';
 require_once 'nepali_date.php';
+require_once 'partials/app_layout.php';
 
 if (!isset($_SESSION['user_id'])) {
-    header('Location: login.php');
+    header("Location: login.php");
     exit();
 }
 
-$userId = (int) $_SESSION['user_id'];
-$userName = $_SESSION['name'] ?? 'User';
+$user_id      = (int)$_SESSION['user_id'];
+$userName     = $_SESSION['name'] ?? 'User';
 $profilePhoto = $_SESSION['profile_photo'] ?? 'default.png';
-$joinedBs = $_SESSION['joined_date_bs'] ?? '—';
-$todayAd = date('Y-m-d');
-$todayBs = NepaliDateConverter::convertAdToBs($todayAd);
-$period = $_GET['period'] ?? 'monthly';
-$customStart = $_GET['start'] ?? '';
-$customEnd = $_GET['end'] ?? '';
+$joinedBs     = $_SESSION['joined_date_bs'] ?? '2083-04-16';
+$today_bs     = NepaliDateConverter::todayBs();
 
-$validDate = static fn ($value) => is_string($value) && preg_match('/^\d{4}-\d{2}-\d{2}$/', $value);
-$periodLabels = [
-    'today' => 'Today', 'weekly' => 'Last 7 Days', 'monthly' => 'Last 30 Days',
-    '6months' => 'Last 6 Months', 'yearly' => 'Last 1 Year', 'all' => 'All Time', 'custom' => 'Custom Range'
+// ----------------------------------------------------
+// 1. DATA AGGREGATION ENGINE (REAL DATABASE VALUES)
+// ----------------------------------------------------
+
+// Lifetime Aggregates by Transaction Type
+$sqlLife = "SELECT transaction_type, IFNULL(SUM(amount), 0) AS total, COUNT(id) as total_count 
+            FROM transactions 
+            WHERE user_id = {$user_id} 
+            GROUP BY transaction_type";
+
+$resLife = $conn->query($sqlLife);
+$life = [
+    'starting_balance' => 0.0, 'income' => 0.0, 'expense' => 0.0, 
+    'investment' => 0.0, 'lend' => 0.0, 'lend_repayment' => 0.0, 
+    'borrow' => 0.0, 'borrow_repayment' => 0.0, 'loss' => 0.0, 'bad_debt' => 0.0
 ];
-$period = array_key_exists($period, $periodLabels) ? $period : 'monthly';
-$where = 'user_id = ?';
-$types = 'i';
-$params = [$userId];
-$periodTitle = $periodLabels[$period];
+$counts = [];
 
-if ($period === 'today') {
-    $where .= ' AND date_ad = ?'; $types .= 's'; $params[] = $todayAd;
-} elseif ($period === 'weekly') {
-    $where .= ' AND date_ad >= DATE_SUB(CURDATE(), INTERVAL 7 DAY)';
-} elseif ($period === 'monthly') {
-    $where .= ' AND date_ad >= DATE_SUB(CURDATE(), INTERVAL 30 DAY)';
-} elseif ($period === '6months') {
-    $where .= ' AND date_ad >= DATE_SUB(CURDATE(), INTERVAL 6 MONTH)';
-} elseif ($period === 'yearly') {
-    $where .= ' AND date_ad >= DATE_SUB(CURDATE(), INTERVAL 1 YEAR)';
-} elseif ($period === 'custom' && $validDate($customStart) && $validDate($customEnd) && $customStart <= $customEnd) {
-    $where .= ' AND date_ad BETWEEN ? AND ?'; $types .= 'ss'; $params[] = $customStart; $params[] = $customEnd;
-} elseif ($period === 'custom') {
-    $period = 'monthly'; $periodTitle = $periodLabels['monthly'];
+if ($resLife) {
+    while ($r = $resLife->fetch_assoc()) {
+        if (array_key_exists($r['transaction_type'], $life)) {
+            $life[$r['transaction_type']] = (float)$r['total'];
+            $counts[$r['transaction_type']] = (int)$r['total_count'];
+        }
+    }
 }
 
-function fetchRows(mysqli $conn, string $sql, string $types, array $params): array {
-    $stmt = $conn->prepare($sql);
-    if (!$stmt) return [];
-    $stmt->bind_param($types, ...$params);
-    $stmt->execute();
-    $result = $stmt->get_result();
-    $rows = $result ? $result->fetch_all(MYSQLI_ASSOC) : [];
-    $stmt->close();
-    return $rows;
+// Payment Channel Balance Breakdown (Digital / Bank vs Hand Cash)
+$sqlCash = "SELECT payment_method,
+    SUM(CASE 
+        WHEN transaction_type IN ('starting_balance', 'income', 'lend_repayment', 'borrow') THEN amount 
+        WHEN transaction_type IN ('expense', 'lend', 'borrow_repayment', 'investment', 'loss', 'bad_debt') THEN -amount 
+        ELSE 0 
+    END) AS net_balance
+    FROM transactions 
+    WHERE user_id = {$user_id}
+    GROUP BY payment_method";
+
+$resCash = $conn->query($sqlCash);
+$digitalCash = 0.0; $handCash = 0.0;
+if ($resCash) {
+    while ($row = $resCash->fetch_assoc()) {
+        $method = strtolower(trim($row['payment_method'] ?? ''));
+        if ($method === 'hand_cash' || $method === 'cash') {
+            $handCash += (float)$row['net_balance'];
+        } else {
+            $digitalCash += (float)$row['net_balance'];
+        }
+    }
+}
+$netLiquidCash = $digitalCash + $handCash;
+
+// Investment Asset Allocation Breakdown
+$resInv = $conn->query("SELECT investment_type, IFNULL(SUM(amount), 0) AS total 
+    FROM transactions 
+    WHERE user_id = {$user_id} AND transaction_type = 'investment' AND status != 'settled' 
+    GROUP BY investment_type");
+
+$sipTotal = 0.0; $ssfTotal = 0.0; $sharesTotal = 0.0;
+if ($resInv) {
+    while ($inv = $resInv->fetch_assoc()) {
+        $type = strtolower(trim($inv['investment_type'] ?? ''));
+        if ($type === 'sip_long_term' || $type === 'sip') {
+            $sipTotal += (float)$inv['total'];
+        } elseif ($type === 'ssf' || $type === 'ssf_fund') {
+            $ssfTotal += (float)$inv['total'];
+        } else {
+            $sharesTotal += (float)$inv['total'];
+        }
+    }
+}
+$defensiveAssets  = $sipTotal + $ssfTotal;
+$totalInvestments = $defensiveAssets + $sharesTotal;
+
+// Subject-wise Expenditure Breakdown
+$sqlExpSubjects = "SELECT IFNULL(NULLIF(TRIM(subject), ''), 'General / Uncategorized') AS subject_name, 
+                          IFNULL(SUM(amount), 0) AS total_amount, 
+                          COUNT(id) as tx_count 
+                   FROM transactions 
+                   WHERE user_id = {$user_id} AND transaction_type = 'expense' 
+                   GROUP BY IFNULL(NULLIF(TRIM(subject), ''), 'General / Uncategorized') 
+                   ORDER BY total_amount DESC";
+
+$resSub = $conn->query($sqlExpSubjects);
+$expenseSubjects = [];
+if ($resSub) {
+    while ($sub = $resSub->fetch_assoc()) {
+        $expenseSubjects[] = $sub;
+    }
 }
 
-$categoryRows = fetchRows($conn, "SELECT transaction_type, COUNT(*) total_count, COALESCE(SUM(amount),0) total_amount FROM transactions WHERE $where GROUP BY transaction_type ORDER BY total_amount DESC", $types, $params);
-$categories = [];
-foreach ($categoryRows as $row) $categories[$row['transaction_type']] = ['count' => (int)$row['total_count'], 'amount' => (float)$row['total_amount']];
-$getAmount = static fn ($key) => $categories[$key]['amount'] ?? 0;
-$starting = $getAmount('starting_balance'); $income = $getAmount('income'); $expense = $getAmount('expense');
-$lend = $getAmount('lend'); $borrow = $getAmount('borrow'); $invest = $getAmount('investment'); $loss = $getAmount('loss');
-$totalInflow = $starting + $income + $borrow; $totalOutflow = $expense + $lend + $invest + $loss; $netLiquidity = $totalInflow - $totalOutflow;
-$totalEntries = array_sum(array_column($categoryRows, 'total_count')); $grandTotal = array_sum(array_column($categoryRows, 'total_amount'));
+// Financial Metrics & Exposure Calculations
+$totalInflow         = $life['starting_balance'] + $life['income'] + $life['lend_repayment'] + $life['borrow'];
+$totalOutflow        = $life['expense'] + $life['lend'] + $life['borrow_repayment'] + $life['investment'] + $life['loss'] + $life['bad_debt'];
+$accountsReceivable  = max(0, $life['lend'] - $life['lend_repayment'] - $life['bad_debt']);
+$accountsPayable     = max(0, $life['borrow'] - $life['borrow_repayment']);
+$equityRiskRatio     = $totalInvestments > 0 ? ($sharesTotal / $totalInvestments) * 100 : 0;
 
-$transactions = fetchRows($conn, "SELECT id, transaction_type, subject, amount, party_name, date_ad, date_bs, remarks FROM transactions WHERE $where ORDER BY date_ad DESC, id DESC", $types, $params);
-$subjectRows = fetchRows($conn, "SELECT subject, transaction_type, COUNT(*) total_count, COALESCE(SUM(amount),0) total_amount FROM transactions WHERE $where GROUP BY subject, transaction_type ORDER BY total_amount DESC LIMIT 50", $types, $params);
-$trendRows = fetchRows($conn, "SELECT DATE_FORMAT(date_ad, '%b %Y') label, DATE_FORMAT(date_ad, '%Y-%m') sort_key, COALESCE(SUM(CASE WHEN transaction_type='income' THEN amount ELSE 0 END),0) income, COALESCE(SUM(CASE WHEN transaction_type='expense' THEN amount ELSE 0 END),0) expense FROM transactions WHERE user_id = ? AND date_ad >= DATE_SUB(CURDATE(), INTERVAL 6 MONTH) GROUP BY sort_key, label ORDER BY sort_key", 'i', [$userId]);
-
-$score = 75;
-if ($income + $starting > 0) { $burn = ($expense / ($income + $starting)) * 100; if ($burn > 75) $score -= 20; if ($invest / ($income + $starting) >= .2) $score += 15; }
-if ($loss > 0) $score -= 10; $score = max(0, min(100, $score));
-$grade = $score >= 85 ? 'A+ / Excellent' : ($score >= 70 ? 'B / Good' : ($score >= 50 ? 'C / Fair' : 'D / At Risk'));
-$gradeTone = $score >= 70 ? 'positive' : ($score >= 50 ? 'warning' : 'danger');
-$topicLabels = ['starting_balance'=>'Starting balance','income'=>'Income','expense'=>'Expense','lend'=>'Receivable','borrow'=>'Liability','investment'=>'Investment','loss'=>'Loss'];
-$topicTone = ['starting_balance'=>'blue','income'=>'green','expense'=>'red','lend'=>'blue','borrow'=>'amber','investment'=>'violet','loss'=>'rose'];
-$exportRows = array_map(static fn($row) => [$row['date_ad'], $row['date_bs'], $row['transaction_type'], $row['subject'], $row['amount'], $row['party_name'] ?? '', $row['remarks'] ?? ''], $transactions);
+renderAppHead('Detailed Financial Audit Report');
+renderAppHeader($userName, $profilePhoto, $joinedBs, $today_bs);
 ?>
-<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Reports · AI Accountant</title>
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+
 <style>
-:root{--navy:#0f172a;--blue:#2563eb;--ink:#172033;--muted:#667085;--line:#e7ebf2;--surface:#fff;--bg:#f5f7fb;--green:#16a34a;--red:#dc2626;--amber:#d97706;--violet:#7c3aed}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;line-height:1.5;padding-bottom:32px}.shell{max-width:1280px;margin:auto;padding:24px}.topbar{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:22px}.identity{display:flex;align-items:center;gap:12px}.avatar{width:44px;height:44px;border-radius:50%;object-fit:cover;border:2px solid #dbe5ff}.eyebrow,.label{font-size:11px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}h1,h2,h3,p{margin:0}.identity h1{font-size:18px}.identity p{font-size:12px;color:var(--muted)}.actions{display:flex;gap:8px;align-items:center}.button{border:1px solid var(--line);background:var(--surface);color:var(--ink);border-radius:9px;padding:10px 13px;font-weight:750;font-size:12px;text-decoration:none;cursor:pointer;transition:.18s}.button:hover{transform:translateY(-1px);box-shadow:0 5px 14px #16213d12}.button.primary{background:var(--blue);color:#fff;border-color:var(--blue)}.button.danger{color:var(--red)}.hero{background:var(--navy);color:#fff;border-radius:18px;padding:26px;margin-bottom:18px;box-shadow:0 12px 28px #0f172a24}.hero-head{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;margin-bottom:23px}.hero h2{font-size:25px;letter-spacing:-.03em}.hero-copy{color:#aab6ca;font-size:13px;margin-top:5px}.health{border:1px solid #ffffff26;border-radius:12px;padding:11px 14px;text-align:right}.health strong{display:block;font-size:18px;color:#fff}.health span{font-size:11px;color:#aab6ca}.metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.metric{background:#ffffff0d;border:1px solid #ffffff16;border-radius:11px;padding:14px}.metric .label{color:#9eabc0}.metric strong{display:block;font-size:21px;margin-top:5px}.metric small{color:#9eabc0;font-size:11px}.filter-card,.card{background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:17px;margin-bottom:18px}.filter-card{display:flex;gap:10px;align-items:end;flex-wrap:wrap}.filter-card label{display:grid;gap:5px;font-size:11px;font-weight:750;color:var(--muted)}select,input{font:inherit;border:1px solid #dfe5ee;border-radius:8px;padding:10px 11px;background:#fff;color:var(--ink);font-size:12px}.custom-date{display:none}.custom-date.visible{display:grid}.grid-2{display:grid;grid-template-columns:1.4fr 1fr;gap:18px}.grid-3{display:grid;grid-template-columns:repeat(3,1fr);gap:18px}.card-head{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:15px}.card h3{font-size:14px}.card-note{font-size:11px;color:var(--muted)}.chart-wrap{height:245px}.allocation{display:flex;align-items:center;gap:18px}.allocation .chart-wrap{height:190px;width:52%}.legend{display:grid;gap:10px;flex:1}.legend-row{display:flex;align-items:center;gap:8px;font-size:12px}.dot{width:9px;height:9px;border-radius:50%}.legend-row strong{margin-left:auto}.table-scroll{overflow:auto}.data-table{width:100%;border-collapse:collapse;min-width:620px}.data-table th{text-align:left;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.06em;padding:9px 8px;border-bottom:1px solid var(--line)}.data-table td{padding:12px 8px;border-bottom:1px solid #f0f2f6;font-size:12px}.data-table tr:last-child td{border-bottom:0}.amount{font-weight:800;text-align:right;white-space:nowrap}.pill{display:inline-flex;border-radius:999px;padding:4px 8px;font-size:10px;font-weight:800}.pill.green{color:#147a38;background:#eaf8ef}.pill.red,.pill.rose{color:#b42318;background:#fff0ef}.pill.blue{color:#1d4ed8;background:#edf3ff}.pill.amber{color:#a15c00;background:#fff6df}.pill.violet{color:#6431c8;background:#f2edff}.progress{height:6px;background:#eef1f6;border-radius:10px;overflow:hidden;min-width:100px}.progress i{display:block;height:100%;border-radius:10px;background:var(--blue)}.insight{display:flex;gap:10px;padding:10px 0;border-bottom:1px solid var(--line);font-size:12px}.insight:last-child{border-bottom:0}.search-row{display:flex;gap:9px;justify-content:space-between;align-items:center;margin-bottom:10px}.search-row input{max-width:250px;width:100%}.pagination{display:flex;justify-content:flex-end;gap:6px;margin-top:12px}.pagination button{border:1px solid var(--line);background:#fff;border-radius:7px;padding:6px 10px;font-size:11px;cursor:pointer}.pagination button.active{background:var(--navy);color:#fff}.bottom-nav{display:none}
-@media(max-width:760px){.shell{padding:16px}.topbar{align-items:flex-start}.actions .button:not(.primary){display:none}.hero-head{display:block}.health{text-align:left;margin-top:16px;display:inline-block}.metrics{grid-template-columns:1fr 1fr}.grid-2,.grid-3{grid-template-columns:1fr}.filter-card{align-items:stretch}.filter-card label,.filter-card select,.filter-card input,.filter-card .button{width:100%}.allocation .chart-wrap{width:48%}.bottom-nav{display:flex;position:fixed;bottom:0;left:0;right:0;background:#fff;border-top:1px solid var(--line);justify-content:space-around;padding:11px;z-index:5}.bottom-nav a{font-size:11px;color:var(--muted);text-decoration:none}.bottom-nav a.active{color:var(--blue);font-weight:800}}
-@media print{body{background:#fff;padding:0}.shell{max-width:none;padding:0}.topbar,.filter-card,.bottom-nav,.actions,.search-row input,.pagination{display:none!important}.hero{box-shadow:none;border-radius:0}.card{break-inside:avoid;box-shadow:none}.grid-2,.grid-3{gap:10px}.data-table{min-width:0}}
+  :root {
+    --bg-main: #f8fafc;
+    --card-bg: #ffffff;
+    --border-color: #cbd5e1;
+    --text-primary: #0f172a;
+    --text-secondary: #475569;
+    --text-muted: #64748b;
+    
+    --accent-blue: #2563eb;
+    --accent-green: #10b981;
+    --accent-red: #ef4444;
+    --accent-amber: #f59e0b;
+  }
+
+  body { background-color: var(--bg-main); color: var(--text-primary); }
+  .report-wrapper { max-width: 900px; margin: 0 auto; padding: 0 12px 100px 12px; }
+
+  /* Dashboard Matching Black Hero Banner */
+  .dashboard-hero {
+    background: #0f172a;
+    color: #ffffff;
+    border-radius: 16px;
+    padding: 22px;
+    margin-bottom: 16px;
+    box-shadow: 0 10px 25px -5px rgba(15, 23, 42, 0.25);
+  }
+  .hero-top-bar {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 6px;
+  }
+  .hero-title {
+    font-size: 18px;
+    font-weight: 800;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    color: #ffffff;
+    letter-spacing: -0.2px;
+  }
+  .hero-badge {
+    font-size: 10px;
+    background: rgba(56, 189, 248, 0.15);
+    color: #38bdf8;
+    border: 1px solid rgba(56, 189, 248, 0.3);
+    padding: 4px 10px;
+    border-radius: 20px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+  .hero-subtext {
+    font-size: 12px;
+    color: #94a3b8;
+    line-height: 1.4;
+  }
+
+  /* Hero KPI Grid */
+  .hero-kpi-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+    gap: 12px;
+    margin-top: 16px;
+    padding-top: 16px;
+    border-top: 1px solid #334155;
+  }
+  .hero-kpi-box { display: flex; flex-direction: column; }
+  .hero-kpi-lbl { font-size: 9px; font-weight: 800; color: #38bdf8; text-transform: uppercase; letter-spacing: 0.5px; }
+  .hero-kpi-val { font-size: 16px; font-weight: 800; color: #ffffff; font-family: monospace; margin-top: 2px; }
+
+  /* Light Section Cards */
+  .section-card {
+    background: var(--card-bg);
+    border: 1px solid var(--border-color);
+    border-radius: 14px;
+    padding: 18px;
+    margin-bottom: 16px;
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.02);
+  }
+  .section-title {
+    font-size: 12px;
+    font-weight: 800;
+    text-transform: uppercase;
+    color: var(--text-primary);
+    margin-bottom: 12px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    letter-spacing: 0.4px;
+  }
+  
+  /* Audit Summary Tables */
+  .audit-table { width: 100%; border-collapse: collapse; font-size: 11px; margin-top: 8px; }
+  .audit-table th { background: #f1f5f9; text-align: left; padding: 9px 10px; font-size: 9px; font-weight: 800; color: var(--text-primary); text-transform: uppercase; border-bottom: 1px solid var(--border-color); }
+  .audit-table td { padding: 9px 10px; border-bottom: 1px solid #f1f5f9; color: var(--text-primary); }
+  .audit-table tr:last-child td { border-bottom: none; }
+
+  /* Split Directives Grid */
+  .directives-container {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+    margin-top: 14px;
+  }
+  @media (max-width: 580px) { .directives-container { grid-template-columns: 1fr; } }
+
+  .directive-box { padding: 12px; border-radius: 10px; font-size: 11px; line-height: 1.45; }
+  .directive-positive { background: #f0fdf4; border: 1px solid #bbf7d0; color: #14532d; }
+  .directive-warning { background: #fef2f2; border: 1px solid #fecaca; color: #7f1d1d; }
+
+  .directive-head { font-weight: 800; text-transform: uppercase; font-size: 10px; margin-bottom: 6px; display: flex; align-items: center; gap: 4px; }
+  .directive-ul { margin: 0; padding-left: 16px; }
+  .directive-ul li { margin-bottom: 4px; }
+  .directive-ul li:last-child { margin-bottom: 0; }
 </style>
-</head>
-<body>
-<div class="shell">
-<header class="topbar"><div class="identity"><img class="avatar" src="uploads/<?= htmlspecialchars($profilePhoto) ?>" alt="<?= htmlspecialchars($userName) ?>" onerror="this.style.display='none'"><div><h1><?= htmlspecialchars($userName) ?></h1><p>Joined <?= htmlspecialchars($joinedBs) ?> BS · Today <?= htmlspecialchars($todayBs) ?> BS</p></div></div><div class="actions"><button class="button" onclick="window.print()">Print / PDF</button><button class="button primary" id="exportButton">Export CSV</button><a class="button danger" href="logout.php">Logout</a></div></header>
-<main>
-<section class="hero"><div class="hero-head"><div><div class="eyebrow">Financial command center</div><h2><?= htmlspecialchars($periodTitle) ?> overview</h2><p class="hero-copy">A clear read on liquidity, spending, and portfolio movement.</p></div><div class="health"><span>Financial health</span><strong><?= htmlspecialchars($grade) ?></strong><span><?= $score ?>/100 score</span></div></div><div class="metrics"><div class="metric"><span class="label">Net liquidity</span><strong>Rs. <?= number_format($netLiquidity,2) ?></strong><small>Inflow less outflow</small></div><div class="metric"><span class="label">Total income</span><strong>Rs. <?= number_format($income,2) ?></strong><small><?= $categories['income']['count'] ?? 0 ?> entries</small></div><div class="metric"><span class="label">Total expenses</span><strong>Rs. <?= number_format($expense,2) ?></strong><small><?= $categories['expense']['count'] ?? 0 ?> entries</small></div><div class="metric"><span class="label">Tracked volume</span><strong>Rs. <?= number_format($grandTotal,2) ?></strong><small><?= $totalEntries ?> transactions</small></div></div></section>
-<form class="filter-card" method="get" id="filterForm"><label>Time period<select name="period" id="periodSelect"><option value="today">Today</option><option value="weekly">Last 7 Days</option><option value="monthly" selected>Last 30 Days</option><option value="6months">Last 6 Months</option><option value="yearly">Last 1 Year</option><option value="all">All Time</option><option value="custom">Custom AD Date Range</option></select></label><label class="custom-date" id="startWrap">From AD<input type="date" name="start" value="<?= htmlspecialchars($customStart) ?>"></label><label class="custom-date" id="endWrap">To AD<input type="date" name="end" value="<?= htmlspecialchars($customEnd) ?>"></label><button class="button primary" type="submit">Apply filters</button><span class="card-note">Showing <?= htmlspecialchars($periodTitle) ?></span></form>
-<section class="grid-2"><div class="card"><div class="card-head"><h3>Income vs expense</h3><span class="card-note">Six-month trend</span></div><div class="chart-wrap"><canvas id="trendChart"></canvas></div></div><div class="card"><div class="card-head"><h3>Asset allocation</h3><span class="card-note">Current period</span></div><div class="allocation"><div class="chart-wrap"><canvas id="allocationChart"></canvas></div><div class="legend"><div class="legend-row"><i class="dot" style="background:#2563eb"></i>SIP / investments <strong>Rs. <?= number_format($invest,0) ?></strong></div><div class="legend-row"><i class="dot" style="background:#16a34a"></i>Starting balance <strong>Rs. <?= number_format($starting,0) ?></strong></div><div class="legend-row"><i class="dot" style="background:#d97706"></i>Receivables <strong>Rs. <?= number_format($lend,0) ?></strong></div></div></div></div></section>
-<section class="grid-3"><div class="card"><div class="card-head"><h3>Spending by subject</h3><span class="card-note">Top categories</span></div><div class="chart-wrap"><canvas id="subjectChart"></canvas></div></div><div class="card"><div class="card-head"><h3>Cash flow mix</h3></div><?php foreach($topicLabels as $key=>$label): $amount=$getAmount($key); $share=$grandTotal > 0 ? min(100, ($amount/$grandTotal)*100) : 0; ?><div style="margin-bottom:13px"><div style="display:flex;justify-content:space-between;font-size:12px"><span><?= htmlspecialchars($label) ?></span><strong>Rs. <?= number_format($amount,0) ?></strong></div><div class="progress"><i style="width:<?= $share ?>%;background:<?= $key==='expense' || $key==='loss' ? 'var(--red)' : 'var(--blue)' ?>"></i></div></div><?php endforeach; ?></div><div class="card"><div class="card-head"><h3>Audit signals</h3><span class="pill <?= $gradeTone ?>"><?= $score >= 70 ? 'Stable' : 'Review' ?></span></div><div class="insight"><span class="pill <?= $expense > $income && $income > 0 ? 'red' : 'green' ?>">Cash</span><span><?= $expense > $income && $income > 0 ? 'Expenses exceed recorded income in this period.' : 'Cash flow is currently within recorded income.' ?></span></div><div class="insight"><span class="pill <?= $loss > 0 ? 'red' : 'green' ?>">Risk</span><span><?= $loss > 0 ? 'Loss entries need an active review.' : 'No loss entries recorded.' ?></span></div><div class="insight"><span class="pill blue">Scope</span><span><?= $totalEntries ?> ledger entries included in this report.</span></div></div></section>
-<section class="card"><div class="card-head"><h3>Subject expenditure</h3><span class="card-note">Searchable summary</span></div><div class="table-scroll"><table class="data-table"><thead><tr><th>Subject</th><th>Type</th><th>Entries</th><th>Share</th><th class="amount">Amount</th></tr></thead><tbody><?php foreach($subjectRows as $row): $share=$grandTotal>0 ? min(100,((float)$row['total_amount']/$grandTotal)*100):0; ?><tr><td><?= htmlspecialchars($row['subject']) ?></td><td><span class="pill <?= $topicTone[$row['transaction_type']] ?? 'blue' ?>"><?= htmlspecialchars($topicLabels[$row['transaction_type']] ?? ucfirst($row['transaction_type'])) ?></span></td><td><?= (int)$row['total_count'] ?></td><td><div class="progress"><i style="width:<?= $share ?>%"></i></div></td><td class="amount">Rs. <?= number_format((float)$row['total_amount'],2) ?></td></tr><?php endforeach; ?></tbody></table></div></section>
-<section class="card"><div class="card-head"><h3>Filtered transaction ledger</h3><span class="card-note"><?= count($transactions) ?> records</span></div><div class="search-row"><span class="card-note">Live search and pagination</span><input id="ledgerSearch" type="search" placeholder="Search subject or type"></div><div class="table-scroll"><table class="data-table" id="ledgerTable"><thead><tr><th>Date</th><th>Type</th><th>Subject</th><th>Party</th><th>Remarks</th><th class="amount">Amount</th></tr></thead><tbody><?php foreach($transactions as $row): ?><tr><td><?= htmlspecialchars($row['date_ad']) ?><br><small class="card-note"><?= htmlspecialchars($row['date_bs']) ?></small></td><td><span class="pill <?= $topicTone[$row['transaction_type']] ?? 'blue' ?>"><?= htmlspecialchars($topicLabels[$row['transaction_type']] ?? ucfirst($row['transaction_type'])) ?></span></td><td><?= htmlspecialchars($row['subject']) ?></td><td><?= htmlspecialchars($row['party_name'] ?? '—') ?></td><td><?= htmlspecialchars($row['remarks'] ?? '—') ?></td><td class="amount">Rs. <?= number_format((float)$row['amount'],2) ?></td></tr><?php endforeach; ?></tbody></table></div><div class="pagination" id="pagination"></div></section>
-</main></div><nav class="bottom-nav"><a class="active" href="reports.php">Reports</a><a href="dashboard.php">Dashboard</a><a href="add_transaction.php">Add transaction</a></nav>
-<script>
-const trendData = <?= json_encode($trendRows, JSON_UNESCAPED_SLASHES) ?>, subjectData = <?= json_encode(array_slice($subjectRows,0,8), JSON_UNESCAPED_SLASHES) ?>;
-const chartOpts={responsive:true,maintainAspectRatio:false,plugins:{legend:{labels:{boxWidth:10,font:{size:10}}}},scales:{x:{grid:{display:false},ticks:{font:{size:10}}},y:{grid:{color:'#eef1f6'},ticks:{font:{size:10}}}}};
-new Chart(document.getElementById('trendChart'),{type:'line',data:{labels:trendData.map(x=>x.label),datasets:[{label:'Income',data:trendData.map(x=>x.income),borderColor:'#16a34a',backgroundColor:'#16a34a18',fill:true,tension:.35},{label:'Expense',data:trendData.map(x=>x.expense),borderColor:'#dc2626',backgroundColor:'#dc262618',fill:true,tension:.35}]},options:chartOpts});
-new Chart(document.getElementById('allocationChart'),{type:'doughnut',data:{labels:['Investments','Starting balance','Receivables'],datasets:[{data:[<?= $invest ?>,<?= $starting ?>,<?= $lend ?>],backgroundColor:['#2563eb','#16a34a','#d97706'],borderWidth:0}]},options:{responsive:true,maintainAspectRatio:false,cutout:'70%',plugins:{legend:{display:false}}}});
-new Chart(document.getElementById('subjectChart'),{type:'bar',data:{labels:subjectData.map(x=>x.subject),datasets:[{label:'Amount',data:subjectData.map(x=>x.total_amount),backgroundColor:'#2563eb',borderRadius:5}]},options:{...chartOpts,indexAxis:'y',plugins:{legend:{display:false}},scales:{x:{grid:{color:'#eef1f6'},ticks:{font:{size:9}}},y:{grid:{display:false},ticks:{font:{size:9}}}}}});
-const periodSelect=document.getElementById('periodSelect'); periodSelect.value='<?= htmlspecialchars($period) ?>'; const toggleDates=()=>document.querySelectorAll('.custom-date').forEach(x=>x.classList.toggle('visible',periodSelect.value==='custom')); periodSelect.addEventListener('change',toggleDates); toggleDates();
-const rows=[...document.querySelectorAll('#ledgerTable tbody tr')], search=document.getElementById('ledgerSearch'), pager=document.getElementById('pagination'); let page=1, perPage=8; function render(){const q=search.value.toLowerCase(), filtered=rows.filter(r=>r.innerText.toLowerCase().includes(q)), pages=Math.max(1,Math.ceil(filtered.length/perPage)); page=Math.min(page,pages); rows.forEach(r=>r.style.display='none'); filtered.slice((page-1)*perPage,page*perPage).forEach(r=>r.style.display=''); pager.innerHTML=''; for(let i=1;i<=pages;i++){const b=document.createElement('button');b.textContent=i;b.className=i===page?'active':'';b.onclick=()=>{page=i;render()};pager.appendChild(b)}} search.addEventListener('input',()=>{page=1;render()}); render();
-const exportRows=<?= json_encode($exportRows, JSON_UNESCAPED_SLASHES) ?>; document.getElementById('exportButton').onclick=()=>{const csv=[['Date AD','Date BS','Type','Subject','Amount','Party','Remarks'],...exportRows].map(r=>r.map(v=>'"'+String(v??'').replaceAll('"','""')+'"').join(',')).join('\n');const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([csv],{type:'text/csv'}));a.download='accountant-<?= $period ?>-report.csv';a.click();URL.revokeObjectURL(a.href)};
-</script></body></html>
+
+<div class="report-wrapper">
+
+    <!-- DARK HERO SECTION (DASHBOARD MATCHING STYLE) -->
+    <div class="dashboard-hero">
+        <div class="hero-top-bar">
+            <div class="hero-title">
+                <span>📊</span> Audit & Analysis
+            </div>
+            <span class="hero-badge">Live Data</span>
+        </div>
+
+
+        <div class="hero-kpi-grid">
+            <div class="hero-kpi-box">
+                <span class="hero-kpi-lbl">Net Liquid Balance</span>
+                <span class="hero-kpi-val" style="color: <?= $netLiquidCash >= 0 ? '#4ade80' : '#f87171' ?>;">
+                    NPR <?= number_format($netLiquidCash, 2) ?>
+                </span>
+            </div>
+            <div class="hero-kpi-box">
+                <span class="hero-kpi-lbl">Total Outflows</span>
+                <span class="hero-kpi-val" style="color: #f87171;">
+                    NPR <?= number_format($totalOutflow, 2) ?>
+                </span>
+            </div>
+            <div class="hero-kpi-box">
+                <span class="hero-kpi-lbl">Active Portfolio</span>
+                <span class="hero-kpi-val" style="color: #38bdf8;">
+                    NPR <?= number_format($totalInvestments, 2) ?>
+                </span>
+            </div>
+            <div class="hero-kpi-box">
+                <span class="hero-kpi-lbl">Net Receivables</span>
+                <span class="hero-kpi-val" style="color: #fbbf24;">
+                    NPR <?= number_format($accountsReceivable, 2) ?>
+                </span>
+            </div>
+        </div>
+    </div>
+
+    <!-- 1. CASHFLOW & PAYMENT CHANNEL RECONCILIATION -->
+    <div class="section-card">
+        <div class="section-title">
+            <span>1. Payment Channel & Liquidity Audit</span>
+            <span style="font-size: 10px; color: var(--text-muted); font-weight: 600;">Reconciliation</span>
+        </div>
+
+        <table class="audit-table">
+            <thead>
+                <tr>
+                    <th>Payment Method</th>
+                    <th>Current Balance</th>
+                    <th>Share of Cash</th>
+                    <th>Status</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td><strong>Digital / Bank Accounts</strong></td>
+                    <td style="font-family: monospace; font-weight: 700;">NPR <?= number_format($digitalCash, 2) ?></td>
+                    <td><?= $netLiquidCash > 0 ? number_format(($digitalCash / $netLiquidCash) * 100, 1) : 0 ?>%</td>
+                    <td>
+                        <span style="color: <?= $digitalCash >= 0 ? 'var(--accent-green)' : 'var(--accent-red)' ?>; font-weight: 800;">
+                            <?= $digitalCash >= 0 ? 'SOLVENT' : 'OVERDRAWN' ?>
+                        </span>
+                    </td>
+                </tr>
+                <tr>
+                    <td><strong>Hand Cash</strong></td>
+                    <td style="font-family: monospace; font-weight: 700;">NPR <?= number_format($handCash, 2) ?></td>
+                    <td><?= $netLiquidCash > 0 ? number_format(($handCash / $netLiquidCash) * 100, 1) : 0 ?>%</td>
+                    <td>
+                        <span style="color: <?= $handCash >= 0 ? 'var(--accent-green)' : 'var(--accent-red)' ?>; font-weight: 800;">
+                            <?= $handCash >= 0 ? 'SOLVENT' : 'DEFICIT' ?>
+                        </span>
+                    </td>
+                </tr>
+            </tbody>
+        </table>
+
+        <div class="directives-container">
+            <div class="directive-box directive-positive">
+                <div class="directive-head" style="color: #166534;">✅ Directives</div>
+                <ul class="directive-ul">
+                    <li>Maintain liquid balances to cover routine operational expenses.</li>
+                    <li>Ensure digital balances form at least 70% of total liquid reserves.</li>
+                </ul>
+            </div>
+            <div class="directive-box directive-warning">
+                <div class="directive-head" style="color: #991b1b;">🚫 Mitigations</div>
+                <ul class="directive-ul">
+                    <li>Do not execute unrecorded physical cash transactions.</li>
+                    <li>Avoid holding excessive cash in hand to reduce untracked leakage.</li>
+                </ul>
+            </div>
+        </div>
+    </div>
+
+    <!-- 2. EXPENDITURE AUDIT BY SUBJECT -->
+    <div class="section-card">
+        <div class="section-title">
+            <span>2. Expenditure Audit by Subject</span>
+            <span style="font-size: 10px; color: var(--text-muted); font-weight: 600;">Total Spent: NPR <?= number_format($life['expense'], 2) ?></span>
+        </div>
+
+        <table class="audit-table">
+            <thead>
+                <tr>
+                    <th>Subject</th>
+                    <th>Logs</th>
+                    <th>Total Capital Spent</th>
+                    <th>% Share</th>
+                </tr>
+            </thead>
+            <tbody>
+                <?php if (!empty($expenseSubjects)): ?>
+                    <?php foreach ($expenseSubjects as $sub): 
+                        $pct = $life['expense'] > 0 ? ($sub['total_amount'] / $life['expense']) * 100 : 0;
+                    ?>
+                        <tr>
+                            <td><strong><?= htmlspecialchars(ucwords($sub['subject_name'])) ?></strong></td>
+                            <td><?= number_format($sub['tx_count']) ?> txns</td>
+                            <td style="font-family: monospace; font-weight: 800; color: var(--accent-red);">
+                                NPR <?= number_format($sub['total_amount'], 2) ?>
+                            </td>
+                            <td><strong><?= number_format($pct, 1) ?>%</strong></td>
+                        </tr>
+                    <?php endforeach; ?>
+                <?php else: ?>
+                    <tr><td colspan="4" style="text-align: center; color: var(--text-muted);">No recorded expenses to evaluate.</td></tr>
+                <?php endif; ?>
+            </tbody>
+        </table>
+
+        <div class="directives-container">
+            <div class="directive-box directive-positive">
+                <div class="directive-head" style="color: #166534;">✅ Spending Directives</div>
+                <ul class="directive-ul">
+                    <li>Cap discretionary subject spending to below 25% of overall inflows.</li>
+                    <li>Review top 2 spending subjects every month for cost optimizations.</li>
+                </ul>
+            </div>
+            <div class="directive-box directive-warning">
+                <div class="directive-head" style="color: #991b1b;">🚫 Cost Warnings</div>
+                <ul class="directive-ul">
+                    <li>Never leave the Subject description field blank when logging expenses.</li>
+                    <li>Ensure unclassified costs remain below 5% of total monthly outflows.</li>
+                </ul>
+            </div>
+        </div>
+    </div>
+
+    <!-- 3. INVESTMENT PORTFOLIO AUDIT -->
+    <div class="section-card">
+        <div class="section-title">
+            <span>3. Portfolio Capital & Volatility Allocation</span>
+            <span style="font-size: 10px; color: var(--text-muted); font-weight: 600;">Invested: NPR <?= number_format($totalInvestments, 2) ?></span>
+        </div>
+
+        <table class="audit-table">
+            <thead>
+                <tr>
+                    <th>Asset Category</th>
+                    <th>Capital Deployed</th>
+                    <th>Weight</th>
+                    <th>Risk Class</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td><strong>Defensive Assets (SIP / SSF)</strong></td>
+                    <td style="font-family: monospace; font-weight: 700;">NPR <?= number_format($defensiveAssets, 2) ?></td>
+                    <td><?= $totalInvestments > 0 ? number_format(($defensiveAssets / $totalInvestments) * 100, 1) : 0 ?>%</td>
+                    <td><span style="color: var(--accent-green); font-weight: 800;">LOW VOLATILITY</span></td>
+                </tr>
+                <tr>
+                    <td><strong>Secondary Market Equities</strong></td>
+                    <td style="font-family: monospace; font-weight: 700;">NPR <?= number_format($sharesTotal, 2) ?></td>
+                    <td><?= number_format($equityRiskRatio, 1) ?>%</td>
+                    <td>
+                        <span style="color: <?= $equityRiskRatio > 50 ? 'var(--accent-red)' : 'var(--accent-amber)' ?>; font-weight: 800;">
+                            <?= $equityRiskRatio > 50 ? 'HIGH VOLATILITY' : 'MODERATE VOLATILITY' ?>
+                        </span>
+                    </td>
+                </tr>
+            </tbody>
+        </table>
+
+        <div class="directives-container">
+            <div class="directive-box directive-positive">
+                <div class="directive-head" style="color: #166534;">✅ Asset Directives</div>
+                <ul class="directive-ul">
+                    <li>Maintain steady recurring installments for long-term SIP and SSF holdings.</li>
+                    <li>Rebalance secondary market equities if exposure surpasses target limits.</li>
+                </ul>
+            </div>
+            <div class="directive-box directive-warning">
+                <div class="directive-head" style="color: #991b1b;">🚫 Portfolio Rules</div>
+                <ul class="directive-ul">
+                    <li>Never use borrowed funds to purchase secondary equity shares.</li>
+                    <li>Avoid liquidating defensive assets to cover short-term operational deficits.</li>
+                </ul>
+            </div>
+        </div>
+    </div>
+
+    <!-- 4. CREDIT, DEBT & RECEIVABLES AUDIT -->
+    <div class="section-card">
+        <div class="section-title">
+            <span>4. Credit Exposure & Bad Debt Recovery</span>
+            <span style="font-size: 10px; color: var(--text-muted); font-weight: 600;">Counterparty Exposure</span>
+        </div>
+
+        <table class="audit-table">
+            <thead>
+                <tr>
+                    <th>Ledger Item</th>
+                    <th>Total Capital Value</th>
+                    <th>Audit Status</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td><strong>Gross Lent Capital</strong></td>
+                    <td style="font-family: monospace; font-weight: 700;">NPR <?= number_format($life['lend'], 2) ?></td>
+                    <td>Lifetime Credit Extended</td>
+                </tr>
+                <tr>
+                    <td><strong>Recovered Capital</strong></td>
+                    <td style="font-family: monospace; font-weight: 700; color: var(--accent-green);">NPR <?= number_format($life['lend_repayment'], 2) ?></td>
+                    <td>Recovered Funds</td>
+                </tr>
+                <tr>
+                    <td><strong>Bad Debt Write-offs</strong></td>
+                    <td style="font-family: monospace; font-weight: 700; color: var(--accent-red);">NPR <?= number_format($life['bad_debt'], 2) ?></td>
+                    <td>Written-off Losses</td>
+                </tr>
+                <tr>
+                    <td><strong>Net Collectible Receivables</strong></td>
+                    <td style="font-family: monospace; font-weight: 700; color: var(--accent-amber);">NPR <?= number_format($accountsReceivable, 2) ?></td>
+                    <td><strong>Active Outstanding Credit</strong></td>
+                </tr>
+            </tbody>
+        </table>
+
+        <div class="directives-container">
+            <div class="directive-box directive-positive">
+                <div class="directive-head" style="color: #166534;">✅ Debt Recovery Strategy</div>
+                <ul class="directive-ul">
+                    <li>Set strict recovery schedules for active outstanding loans.</li>
+                    <li>Prioritize paying down active debt obligations promptly.</li>
+                </ul>
+            </div>
+            <div class="directive-box directive-warning">
+                <div class="directive-head" style="color: #991b1b;">🚫 Credit Risk Warnings</div>
+                <ul class="directive-ul">
+                    <li>Halt extending credit to borrowers who have uncollected defaults.</li>
+                    <li>Promptly write off uncollectible receivables as Bad Debt to maintain clear ledger integrity.</li>
+                </ul>
+            </div>
+        </div>
+    </div>
+
+</div>
+
+<?php renderBottomNav('reports'); ?>
+</body>
+</html>
